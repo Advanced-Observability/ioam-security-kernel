@@ -1,0 +1,102 @@
+diff --git a/include/uapi/linux/ioam6_genl.h b/include/uapi/linux/ioam6_genl.h
+index 3f89b53..84a060d 100644
+--- a/include/uapi/linux/ioam6_genl.h
++++ b/include/uapi/linux/ioam6_genl.h
+@@ -24,6 +24,9 @@ enum {
+ 	IOAM6_ATTR_SC_DATA,	/* Binary */
+ 	IOAM6_ATTR_SC_NONE,	/* Flag */
+ 
++#define IOAM6_CIPHER_KEY_LEN 32
++	IOAM6_ATTR_KEY,
++
+ 	IOAM6_ATTR_PAD,
+ 
+ 	__IOAM6_ATTR_MAX,
+@@ -44,6 +47,8 @@ enum {
+ 
+ 	IOAM6_CMD_NS_SET_SCHEMA,
+ 
++	IOAM6_CMD_NS_SET_KEY,
++
+ 	__IOAM6_CMD_MAX,
+ };
+ 
+diff --git a/ip/ipioam6.c b/ip/ipioam6.c
+index 1886098..1bb32ad 100644
+--- a/ip/ipioam6.c
++++ b/ip/ipioam6.c
+@@ -32,6 +32,7 @@ static void usage(void)
+ 		"	ip ioam schema add ID DATA\n"
+ 		"	ip ioam schema del ID\n"
+ 		"	ip ioam namespace set ID schema { ID | none }\n"
++		"	ip ioam namespace set ID key DATA\n"
+ 		"	ip ioam monitor\n");
+ 	exit(-1);
+ }
+@@ -54,6 +55,7 @@ static struct {
+ 	bool has_ns_data_wide;
+ 	bool sc_none;
+ 	__u8 sc_data[IOAM6_MAX_SCHEMA_DATA_LEN];
++	__u8 key_data[IOAM6_CIPHER_KEY_LEN];
+ } opts;
+ 
+ static void print_namespace(struct rtattr *attrs[])
+@@ -242,6 +244,11 @@ static int ioam6_do_cmd(void)
+ 			addattr32(&req.n, sizeof(req), IOAM6_ATTR_SC_ID,
+ 				  opts.sc_id);
+ 		break;
++	case IOAM6_CMD_NS_SET_KEY:
++		addattr16(&req.n, sizeof(req), IOAM6_ATTR_NS_ID, opts.ns_id);
++		addattr_l(&req.n, sizeof(req), IOAM6_ATTR_KEY, opts.key_data,
++				strlen((const char *)opts.key_data));
++		break;
+ 	}
+ 
+ 	if (!dump) {
+@@ -345,23 +352,35 @@ int do_ioam6(int argc, char **argv)
+ 
+ 			NEXT_ARG();
+ 
+-			if (strcmp(*argv, "schema") != 0)
+-				invarg("Unknown", *argv);
++			if (strcmp(*argv, "schema") == 0) {
++				NEXT_ARG();
+ 
+-			NEXT_ARG();
++				if (strcmp(*argv, "none") == 0) {
++					opts.sc_none = true;
+ 
+-			if (strcmp(*argv, "none") == 0) {
+-				opts.sc_none = true;
++				} else {
++					if (get_u32(&opts.sc_id, *argv, 0))
++						invarg("Invalid schema ID", *argv);
+ 
+-			} else {
+-				if (get_u32(&opts.sc_id, *argv, 0))
+-					invarg("Invalid schema ID", *argv);
++					opts.sc_none = false;
++				}
+ 
+-				opts.sc_none = false;
+-			}
++				opts.cmd = IOAM6_CMD_NS_SET_SCHEMA;
++
++			} else if (strcmp(*argv, "key") == 0) {
++				NEXT_ARG();
++
++				if (strlen(*argv) > IOAM6_CIPHER_KEY_LEN)
++					invarg("Key is too big", *argv);
++				if (strlen(*argv) == 0)
++					invarg("Key cannot be null", *argv);
+ 
+-			opts.cmd = IOAM6_CMD_NS_SET_SCHEMA;
++				memcpy(opts.key_data, *argv, strlen(*argv));
++				opts.cmd = IOAM6_CMD_NS_SET_KEY;
+ 
++			} else {
++				invarg("Unknown", *argv);
++			}
+ 		} else {
+ 			invarg("Unknown", *argv);
+ 		}

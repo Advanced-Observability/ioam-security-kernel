@@ -1,0 +1,700 @@
+diff --git a/include/linux/ipv6.h b/include/linux/ipv6.h
+index 43b7bb828..b4f858997 100644
+--- a/include/linux/ipv6.h
++++ b/include/linux/ipv6.h
+@@ -88,6 +88,8 @@ struct ipv6_devconf {
+ 	__u32		ioam6_id;
+ 	__u32		ioam6_id_wide;
+ 	__u8		ioam6_enabled;
++	__u8		ioam6_sec_enabled;
++	__u8		ioam6_sec_chacha; // if not set, assume aes-gcm
+ 	__u8		ndisc_evict_nocarrier;
+ 	__u8		ra_honor_pio_life;
+ 	__u8		ra_honor_pio_pflag;
+diff --git a/include/net/ioam6.h b/include/net/ioam6.h
+index 2cbbee6e8..e0bc92912 100644
+--- a/include/net/ioam6.h
++++ b/include/net/ioam6.h
+@@ -14,6 +14,7 @@
+ #include <linux/ioam6.h>
+ #include <linux/ioam6_genl.h>
+ #include <linux/rhashtable-types.h>
++#include <crypto/aead.h>
+ 
+ struct ioam6_namespace {
+ 	struct rhash_head head;
+@@ -24,6 +25,13 @@ struct ioam6_namespace {
+ 	__be16 id;
+ 	__be32 data;
+ 	__be64 data_wide;
++
++#define IOAM6_CIPHER_TAG_LEN 16
++#define IOAM6_CIPHER_NONCE_LEN 12
++#define IOAM6_MAX_IOAM_NODE_DATA 48
++	atomic_t pkt_cnt;
++	struct crypto_aead *aes;
++	struct crypto_aead *chacha;
+ };
+ 
+ struct ioam6_schema {
+@@ -60,6 +68,18 @@ void ioam6_fill_trace_data(struct sk_buff *skb,
+ 			   struct ioam6_trace_hdr *trace,
+ 			   bool is_input);
+ 
++enum ioam6_sec_algo { AES_GCM, CHACHA };
++struct crypto_aead *ioam6_aead(struct ioam6_namespace *ns, enum ioam6_sec_algo algo);
++
++int ioam6_sec_aead(enum ioam6_sec_algo algo, u8 *payload, u8 *nonce, u8 *tag,
++		   struct net *net, struct ioam6_namespace *ns,
++		   struct ioam6_trace_hdr *trace);
++
++void ioam6_gather_data(struct sk_buff *skb,
++		       struct ioam6_namespace *ns,
++		       struct ioam6_trace_hdr *trace,
++		       bool is_input, u8 *buffer);
++
+ int ioam6_init(void);
+ void ioam6_exit(void);
+ 
+diff --git a/include/net/netns/ipv6.h b/include/net/netns/ipv6.h
+index 47dc70d81..a89c39416 100644
+--- a/include/net/netns/ipv6.h
++++ b/include/net/netns/ipv6.h
+@@ -53,6 +53,8 @@ struct netns_sysctl_ipv6 {
+ 	int seg6_flowlabel;
+ 	u32 ioam6_id;
+ 	u64 ioam6_id_wide;
++	u8 ioam6_encap_security;
++	u8 ioam6_encap_security_chacha;
+ 	u8 skip_notify_on_dev_down;
+ 	u8 fib_notify_on_flag_change;
+ 	u8 icmpv6_error_anycast_as_unicast;
+diff --git a/include/uapi/linux/ioam6_genl.h b/include/uapi/linux/ioam6_genl.h
+index 1733fbc51..8ca1901c5 100644
+--- a/include/uapi/linux/ioam6_genl.h
++++ b/include/uapi/linux/ioam6_genl.h
+@@ -24,6 +24,9 @@ enum {
+ 	IOAM6_ATTR_SC_DATA,	/* Binary */
+ 	IOAM6_ATTR_SC_NONE,	/* Flag */
+ 
++#define IOAM6_CIPHER_KEY_LEN 32
++	IOAM6_ATTR_KEY,
++
+ 	IOAM6_ATTR_PAD,
+ 
+ 	__IOAM6_ATTR_MAX,
+@@ -44,6 +47,8 @@ enum {
+ 
+ 	IOAM6_CMD_NS_SET_SCHEMA,
+ 
++	IOAM6_CMD_NS_SET_KEY,
++
+ 	__IOAM6_CMD_MAX,
+ };
+ 
+diff --git a/include/uapi/linux/ipv6.h b/include/uapi/linux/ipv6.h
+index d4d3ae774..ef4e19ae1 100644
+--- a/include/uapi/linux/ipv6.h
++++ b/include/uapi/linux/ipv6.h
+@@ -193,6 +193,8 @@ enum {
+ 	DEVCONF_NDISC_TCLASS,
+ 	DEVCONF_RPL_SEG_ENABLED,
+ 	DEVCONF_RA_DEFRTR_METRIC,
++	DEVCONF_IOAM6_SEC_CHACHA,
++	DEVCONF_IOAM6_SEC_ENABLED,
+ 	DEVCONF_IOAM6_ENABLED,
+ 	DEVCONF_IOAM6_ID,
+ 	DEVCONF_IOAM6_ID_WIDE,
+diff --git a/net/ipv6/addrconf.c b/net/ipv6/addrconf.c
+index 40e9c336f..428304328 100644
+--- a/net/ipv6/addrconf.c
++++ b/net/ipv6/addrconf.c
+@@ -236,6 +236,8 @@ static struct ipv6_devconf ipv6_devconf __read_mostly = {
+ 	.ioam6_enabled		= 0,
+ 	.ioam6_id               = IOAM6_DEFAULT_IF_ID,
+ 	.ioam6_id_wide		= IOAM6_DEFAULT_IF_ID_WIDE,
++	.ioam6_sec_enabled	= 0,
++	.ioam6_sec_chacha	= 0,
+ 	.ndisc_evict_nocarrier	= 1,
+ 	.ra_honor_pio_life	= 0,
+ 	.ra_honor_pio_pflag	= 0,
+@@ -301,6 +303,8 @@ static struct ipv6_devconf ipv6_devconf_dflt __read_mostly = {
+ 	.ioam6_enabled		= 0,
+ 	.ioam6_id               = IOAM6_DEFAULT_IF_ID,
+ 	.ioam6_id_wide		= IOAM6_DEFAULT_IF_ID_WIDE,
++	.ioam6_sec_enabled	= 0,
++	.ioam6_sec_chacha	= 0,
+ 	.ndisc_evict_nocarrier	= 1,
+ 	.ra_honor_pio_life	= 0,
+ 	.ra_honor_pio_pflag	= 0,
+@@ -5708,6 +5712,8 @@ static void ipv6_store_devconf(const struct ipv6_devconf *cnf,
+ 	array[DEVCONF_NDISC_TCLASS] = READ_ONCE(cnf->ndisc_tclass);
+ 	array[DEVCONF_RPL_SEG_ENABLED] = READ_ONCE(cnf->rpl_seg_enabled);
+ 	array[DEVCONF_IOAM6_ENABLED] = READ_ONCE(cnf->ioam6_enabled);
++	array[DEVCONF_IOAM6_SEC_ENABLED] = READ_ONCE(cnf->ioam6_sec_enabled);
++	array[DEVCONF_IOAM6_SEC_CHACHA] = READ_ONCE(cnf->ioam6_sec_chacha);
+ 	array[DEVCONF_IOAM6_ID] = READ_ONCE(cnf->ioam6_id);
+ 	array[DEVCONF_IOAM6_ID_WIDE] = READ_ONCE(cnf->ioam6_id_wide);
+ 	array[DEVCONF_NDISC_EVICT_NOCARRIER] =
+@@ -7251,6 +7257,24 @@ static const struct ctl_table addrconf_sysctl[] = {
+ 		.extra1		= (void *)SYSCTL_ZERO,
+ 		.extra2		= (void *)SYSCTL_ONE,
+ 	},
++	{
++		.procname	= "ioam6_sec_enabled",
++		.data		= &ipv6_devconf.ioam6_sec_enabled,
++		.maxlen		= sizeof(u8),
++		.mode		= 0644,
++		.proc_handler	= proc_dou8vec_minmax,
++		.extra1		= (void *)SYSCTL_ZERO,
++		.extra2		= (void *)SYSCTL_ONE,
++	},
++	{
++		.procname	= "ioam6_sec_chacha",
++		.data		= &ipv6_devconf.ioam6_sec_chacha,
++		.maxlen		= sizeof(u8),
++		.mode		= 0644,
++		.proc_handler	= proc_dou8vec_minmax,
++		.extra1		= (void *)SYSCTL_ZERO,
++		.extra2		= (void *)SYSCTL_ONE,
++	},
+ 	{
+ 		.procname	= "ioam6_id",
+ 		.data		= &ipv6_devconf.ioam6_id,
+diff --git a/net/ipv6/af_inet6.c b/net/ipv6/af_inet6.c
+index 1b0314644..3f166e702 100644
+--- a/net/ipv6/af_inet6.c
++++ b/net/ipv6/af_inet6.c
+@@ -983,6 +983,8 @@ static int __net_init inet6_net_init(struct net *net)
+ 
+ 	net->ipv6.sysctl.ioam6_id = IOAM6_DEFAULT_ID;
+ 	net->ipv6.sysctl.ioam6_id_wide = IOAM6_DEFAULT_ID_WIDE;
++	net->ipv6.sysctl.ioam6_encap_security = 0;
++	net->ipv6.sysctl.ioam6_encap_security_chacha = 0;
+ 
+ 	err = ipv6_init_mibs(net);
+ 	if (err)
+diff --git a/net/ipv6/exthdrs.c b/net/ipv6/exthdrs.c
+index a23eb8734..52086f6c9 100644
+--- a/net/ipv6/exthdrs.c
++++ b/net/ipv6/exthdrs.c
+@@ -56,6 +56,12 @@
+ 
+ #include <linux/uaccess.h>
+ 
++#include <linux/crypto.h>
++#include <crypto/aead.h>
++#include <linux/scatterlist.h>
++#include <linux/unaligned.h>
++#include <linux/printk.h>
++
+ /*********************
+   Generic functions
+  *********************/
+@@ -179,6 +185,13 @@ static bool ip6_parse_tlv(bool hopbyhop,
+ 					if (!ipv6_hop_ioam(skb, off))
+ 						return false;
+ 
++					if(READ_ONCE(__in6_dev_get(skb->dev)->cnf.ioam6_sec_enabled)) {
++						// ptoLen is decreased once at then end of the loop
++						// need to decrease 3 additional times because we assume ptoSize is *4.
++						off+=3*(optlen-12);
++						len-=3*(optlen-12);
++					}
++
+ 					nh = skb_network_header(skb);
+ 					break;
+ 				case IPV6_TLV_JUMBO:
+@@ -899,12 +912,16 @@ static bool ipv6_hop_ra(struct sk_buff *skb, int optoff)
+ }
+ 
+ /* IOAM */
+-
+ static bool ipv6_hop_ioam(struct sk_buff *skb, int optoff)
+ {
++	u8 payload[IOAM6_MAX_IOAM_NODE_DATA] = {0};
++	u8 trace_size, payload_len, offset, *addr;
++	u8 nonce[IOAM6_CIPHER_NONCE_LEN] = {0};
++	u8 tag[IOAM6_CIPHER_TAG_LEN] = {0};
+ 	struct ioam6_trace_hdr *trace;
+ 	struct ioam6_namespace *ns;
+ 	struct ioam6_hdr *hdr;
++	u32 cnt;
+ 
+ 	/* Bad alignment (must be 4n-aligned) */
+ 	if (optoff & 3)
+@@ -930,15 +947,21 @@ static bool ipv6_hop_ioam(struct sk_buff *skb, int optoff)
+ 		if (hdr->opt_len < 2 + sizeof(*trace) + trace->remlen * 4)
+ 			goto drop;
+ 
++		payload_len = trace->nodelen * 4;
++
+ 		/* Ignore if the IOAM namespace is unknown */
+ 		ns = ioam6_namespace(dev_net(skb->dev), trace->namespace_id);
+ 		if (!ns)
+ 			goto ignore;
+ 
++		cnt = atomic_fetch_inc(&ns->pkt_cnt);
++		put_unaligned_be32(cnt, nonce+8);
++
+ 		if (!skb_valid_dst(skb))
+ 			ip6_route_input(skb);
+ 
+ 		/* About to mangle packet header */
++		// Risky because we are using remlen *16 for security
+ 		if (skb_ensure_writable(skb, optoff + 2 + hdr->opt_len))
+ 			goto drop;
+ 
+@@ -946,10 +969,40 @@ static bool ipv6_hop_ioam(struct sk_buff *skb, int optoff)
+ 		trace = (struct ioam6_trace_hdr *)(skb_network_header(skb)
+ 						   + optoff + sizeof(*hdr));
+ 
+-		ioam6_fill_trace_data(skb, ns, trace, true);
++		if (READ_ONCE(__in6_dev_get(skb->dev)->cnf.ioam6_sec_enabled)) {
++			if(trace->overflow)
++				goto ignore;
++
++			trace_size = hdr->opt_len - 10; // 2B for reserved + IOAM Opt-Type and 8B for PTO header
++
++			// We have multipled trace size by 4 at encap
++			// Math here is in multiples of 4B
++			if (trace->remlen*4 < trace->nodelen + IOAM6_CIPHER_NONCE_LEN/4 + IOAM6_CIPHER_TAG_LEN/4)
++				goto drop;
++
++			ioam6_gather_data(skb, ns, trace, true, payload);
++
++			if (READ_ONCE(__in6_dev_get(skb->dev)->cnf.ioam6_sec_chacha))
++				ioam6_sec_aead(CHACHA, payload, nonce, tag, dev_net(skb->dev), ns, trace);
++			else
++				ioam6_sec_aead(AES_GCM, payload, nonce, tag, dev_net(skb->dev), ns, trace);
++
++			offset = ALIGN(payload_len + IOAM6_CIPHER_TAG_LEN + IOAM6_CIPHER_NONCE_LEN, 16);
++			addr = trace->data + trace->remlen * 16 - offset;
++			memcpy(addr, nonce, IOAM6_CIPHER_NONCE_LEN);
++			addr+=IOAM6_CIPHER_NONCE_LEN;
++			memcpy(addr, tag, IOAM6_CIPHER_TAG_LEN);
++			addr+=IOAM6_CIPHER_TAG_LEN;
++			memcpy(addr, payload, payload_len);
++			// ioam6_gather_data is not modifying remlen value -- reminder both are in multiple of 4B
++			trace->remlen -= offset/16;
++		} else {
++			// in this case, we do not assume *4 ptoSize
++			// so data will be in the "middle" of the option
++			ioam6_fill_trace_data(skb, ns, trace, true);
++			ioam6_event(IOAM6_EVENT_TRACE, dev_net(skb->dev), GFP_ATOMIC, (void *)trace, hdr->opt_len - 2);
++		}
+ 
+-		ioam6_event(IOAM6_EVENT_TRACE, dev_net(skb->dev),
+-			    GFP_ATOMIC, (void *)trace, hdr->opt_len - 2);
+ 		break;
+ 	default:
+ 		break;
+diff --git a/net/ipv6/ioam6.c b/net/ipv6/ioam6.c
+index 9553a3200..3c5f7382d 100644
+--- a/net/ipv6/ioam6.c
++++ b/net/ipv6/ioam6.c
+@@ -20,6 +20,9 @@
+ #include <net/ioam6.h>
+ #include <net/sch_generic.h>
+ 
++#include <crypto/aead.h>
++#include <linux/err.h>
++
+ static void ioam6_ns_release(struct ioam6_namespace *ns)
+ {
+ 	kfree_rcu(ns, rcu);
+@@ -104,8 +107,14 @@ static const struct nla_policy ioam6_genl_policy_ns_sc[] = {
+ 	[IOAM6_ATTR_SC_NONE]	= { .type = NLA_FLAG },
+ };
+ 
++static const struct nla_policy ioam6_genl_policy_ns_key[] = {
++	[IOAM6_ATTR_NS_ID]	= { .type = NLA_U16 },
++	[IOAM6_ATTR_KEY]	= { .type = NLA_BINARY, .len = IOAM6_CIPHER_KEY_LEN },
++};
++
+ static int ioam6_genl_addns(struct sk_buff *skb, struct genl_info *info)
+ {
++	u8 key[IOAM6_CIPHER_KEY_LEN]= {0};
+ 	struct ioam6_pernet_data *nsdata;
+ 	struct ioam6_namespace *ns;
+ 	u64 data64;
+@@ -143,6 +152,35 @@ static int ioam6_genl_addns(struct sk_buff *skb, struct genl_info *info)
+ 
+ 	ns->data = cpu_to_be32(data32);
+ 	ns->data_wide = cpu_to_be64(data64);
++	atomic_set(&ns->pkt_cnt, 0);
++
++	ns->aes = crypto_alloc_aead("gcm(aes)", 0, 0);
++	if (IS_ERR(ns->aes)) {
++		err = 1;
++		goto out_unlock;
++	}
++
++	err = crypto_aead_setkey(ns->aes, key, IOAM6_CIPHER_KEY_LEN);
++	if (err)
++		goto out_unlock;
++
++	err = crypto_aead_setauthsize(ns->aes, IOAM6_CIPHER_TAG_LEN);
++	if (err)
++		goto out_unlock;
++
++	ns->chacha = crypto_alloc_aead("rfc7539(chacha20,poly1305)", 0, 0);
++	if (IS_ERR(ns->chacha)) {
++		err = 1;
++		goto out_unlock;
++	}
++
++	err = crypto_aead_setkey(ns->chacha, key, IOAM6_CIPHER_KEY_LEN);
++	if (err)
++		goto out_unlock;
++
++	err = crypto_aead_setauthsize(ns->chacha, IOAM6_CIPHER_TAG_LEN);
++	if (err)
++		goto out_unlock;
+ 
+ 	err = rhashtable_lookup_insert_fast(&nsdata->namespaces, &ns->head,
+ 					    rht_ns_params);
+@@ -179,6 +217,12 @@ static int ioam6_genl_delns(struct sk_buff *skb, struct genl_info *info)
+ 	sc = rcu_dereference_protected(ns->schema,
+ 				       lockdep_is_held(&nsdata->lock));
+ 
++	if (ns->aes)
++		crypto_free_aead(ns->aes);
++
++	if (ns->chacha)
++		crypto_free_aead(ns->chacha);
++
+ 	err = rhashtable_remove_fast(&nsdata->namespaces, &ns->head,
+ 				     rht_ns_params);
+ 	if (err)
+@@ -549,6 +593,46 @@ static int ioam6_genl_ns_set_schema(struct sk_buff *skb, struct genl_info *info)
+ 	return err;
+ }
+ 
++static int ioam6_genl_ns_set_key(struct sk_buff *skb, struct genl_info *info)
++{
++	u8 key[IOAM6_CIPHER_KEY_LEN] = {0};
++	struct ioam6_pernet_data *nsdata;
++	struct ioam6_namespace *ns;
++	__be16 ns_id;
++	int err;
++
++	if(!info->attrs[IOAM6_ATTR_NS_ID] || !info->attrs[IOAM6_ATTR_KEY])
++		return -EINVAL;
++
++	ns_id = cpu_to_be16(nla_get_u16(info->attrs[IOAM6_ATTR_NS_ID]));
++	nsdata = ioam6_pernet(genl_info_net(info));
++	if(!nsdata)
++		return -ENOENT;
++
++	mutex_lock(&nsdata->lock);
++
++	ns = rhashtable_lookup_fast(&nsdata->namespaces, &ns_id, rht_ns_params);
++	if (!ns) {
++		err = -ENOENT;
++		goto out_unlock;
++	}
++
++	nla_memcpy(key, info->attrs[IOAM6_ATTR_KEY], IOAM6_CIPHER_KEY_LEN);
++
++	err = crypto_aead_setkey(ns->aes, key, IOAM6_CIPHER_KEY_LEN);
++	if (err)
++		goto out_unlock;
++
++	err = crypto_aead_setkey(ns->chacha, key, IOAM6_CIPHER_KEY_LEN);
++	if (err)
++		goto out_unlock;
++
++	err = 0;
++out_unlock:
++	mutex_unlock(&nsdata->lock);
++	return err;
++}
++
+ static const struct genl_ops ioam6_genl_ops[] = {
+ 	{
+ 		.cmd	= IOAM6_CMD_ADD_NAMESPACE,
+@@ -606,6 +690,15 @@ static const struct genl_ops ioam6_genl_ops[] = {
+ 		.policy	= ioam6_genl_policy_ns_sc,
+ 		.maxattr = ARRAY_SIZE(ioam6_genl_policy_ns_sc) - 1,
+ 	},
++	{
++		.cmd	= IOAM6_CMD_NS_SET_KEY,
++		.validate = GENL_DONT_VALIDATE_STRICT | GENL_DONT_VALIDATE_DUMP,
++		.doit	= ioam6_genl_ns_set_key,
++		.flags	= GENL_ADMIN_PERM,
++		.policy	= ioam6_genl_policy_ns_key,
++		.maxattr = ARRAY_SIZE(ioam6_genl_policy_ns_key) - 1,
++	},
++
+ };
+ 
+ #define IOAM6_GENL_EV_GRP_OFFSET 0
+@@ -677,7 +770,7 @@ static struct genl_family ioam6_genl_family __ro_after_init = {
+ 	.parallel_ops	= true,
+ 	.ops		= ioam6_genl_ops,
+ 	.n_ops		= ARRAY_SIZE(ioam6_genl_ops),
+-	.resv_start_op	= IOAM6_CMD_NS_SET_SCHEMA + 1,
++	.resv_start_op	= IOAM6_CMD_NS_SET_KEY + 1,
+ 	.mcgrps		= ioam6_mcgrps,
+ 	.n_mcgrps	= ARRAY_SIZE(ioam6_mcgrps),
+ 	.module		= THIS_MODULE,
+@@ -694,7 +787,7 @@ static void __ioam6_fill_trace_data(struct sk_buff *skb,
+ 				    struct ioam6_namespace *ns,
+ 				    struct ioam6_trace_hdr *trace,
+ 				    struct ioam6_schema *sc,
+-				    u8 sclen, bool is_input)
++				    u8 sclen, bool is_input, u8 *buffer)
+ {
+ 	struct net_device *dev = skb_dst_dev(skb);
+ 	struct timespec64 ts;
+@@ -705,7 +798,10 @@ static void __ioam6_fill_trace_data(struct sk_buff *skb,
+ 	u8 *data;
+ 	u8 byte;
+ 
+-	data = trace->data + trace->remlen * 4 - trace->nodelen * 4 - sclen * 4;
++	if (!buffer)
++		data = trace->data + trace->remlen * 4 - trace->nodelen * 4 - sclen * 4;
++	else
++		data = buffer;
+ 
+ 	/* hop_lim and node_id */
+ 	if (trace->type.bit0) {
+@@ -952,10 +1048,64 @@ void ioam6_fill_trace_data(struct sk_buff *skb,
+ 		return;
+ 	}
+ 
+-	__ioam6_fill_trace_data(skb, ns, trace, sc, sclen, is_input);
++	__ioam6_fill_trace_data(skb, ns, trace, sc, sclen, is_input, NULL);
+ 	trace->remlen -= trace->nodelen + sclen;
+ }
+ 
++void ioam6_gather_data(struct sk_buff *skb,
++			   struct ioam6_namespace *ns,
++			   struct ioam6_trace_hdr *trace,
++			   bool is_input, u8 *buffer)
++{
++	return __ioam6_fill_trace_data(skb, ns, trace, NULL, 0, is_input, buffer);
++}
++
++struct crypto_aead *ioam6_aead(struct ioam6_namespace *ns, enum ioam6_sec_algo algo)
++{
++	return algo == AES_GCM ? ns->aes : ns->chacha;
++}
++
++int ioam6_sec_aead(enum ioam6_sec_algo algo, u8 *payload, u8 *nonce, u8 *tag,
++		     struct net *net, struct ioam6_namespace *ns, struct ioam6_trace_hdr *trace)
++{
++	if (!payload || !nonce || !tag || !net || !ns || !trace)
++		return -1;
++
++	size_t payload_len = trace->nodelen * 4;
++	struct scatterlist src[1], dst[2];
++	struct aead_request *req;
++	struct crypto_aead *tfm;
++	int err;
++
++	tfm = ioam6_aead(ns, algo);
++	if (!tfm)
++		return -1;
++
++	req = aead_request_alloc(tfm, GFP_ATOMIC);
++	if (!req)
++		return -ENOMEM;
++
++	sg_init_table(src, 1);
++	sg_set_buf(&src[0], payload, payload_len);
++
++	sg_init_table(dst, 2);
++	sg_set_buf(&dst[0], payload, payload_len);
++	sg_set_buf(&dst[1], tag, IOAM6_CIPHER_TAG_LEN);
++
++	aead_request_set_ad(req, 0);
++	aead_request_set_crypt(req, src, dst, payload_len, nonce);
++
++	err = crypto_aead_encrypt(req);
++	if (err) {
++		aead_request_free(req);
++		return -1;
++	}
++
++	aead_request_free(req);
++
++	return 0;
++}
++
+ static int __net_init ioam6_net_init(struct net *net)
+ {
+ 	struct ioam6_pernet_data *nsdata;
+diff --git a/net/ipv6/ioam6_iptunnel.c b/net/ipv6/ioam6_iptunnel.c
+index 1fe7894f1..6a63d7332 100644
+--- a/net/ipv6/ioam6_iptunnel.c
++++ b/net/ipv6/ioam6_iptunnel.c
+@@ -116,6 +116,7 @@ static int ioam6_build_state(struct net *net, struct nlattr *nla,
+ 	struct ioam6_lwt *ilwt;
+ 	int len_aligned, err;
+ 	u32 freq_k, freq_n;
++	bool security;
+ 	u8 mode;
+ 
+ 	if (family != AF_INET6)
+@@ -168,7 +169,13 @@ static int ioam6_build_state(struct net *net, struct nlattr *nla,
+ 		return -EINVAL;
+ 	}
+ 
+-	len_aligned = ALIGN(trace->remlen * 4, 8);
++	security = net->ipv6.sysctl.ioam6_encap_security;
++	if (!security)
++		len_aligned = ALIGN(trace->remlen * 4, 8);
++	else
++		// *4 to increase size of pto data
++		len_aligned = ALIGN(trace->remlen * 4 * 4, 8);
++
+ 	lwt = lwtunnel_state_alloc(sizeof(*ilwt) + len_aligned);
+ 	if (!lwt)
+ 		return -ENOMEM;
+@@ -227,11 +234,17 @@ static int ioam6_build_state(struct net *net, struct nlattr *nla,
+ 
+ 	memcpy(&tuninfo->traceh, trace, sizeof(*trace));
+ 
+-	if (len_aligned - trace->remlen * 4) {
++	if (!security && len_aligned - trace->remlen * 4) {
+ 		tuninfo->traceh.data[trace->remlen * 4] = IPV6_TLV_PADN;
+ 		tuninfo->traceh.data[trace->remlen * 4 + 1] = 2;
+ 	}
+ 
++	if (security && len_aligned - trace->remlen * 16) {
++		tuninfo->traceh.data[trace->remlen * 16] = IPV6_TLV_PADN;
++		u8 len = len_aligned - trace->remlen * 16 - 2;
++		tuninfo->traceh.data[trace->remlen * 16 + 1] = len;
++	}
++
+ 	lwt->type = LWTUNNEL_ENCAP_IOAM6;
+ 	lwt->flags |= LWTUNNEL_STATE_OUTPUT_REDIRECT;
+ 
+@@ -245,26 +258,66 @@ static int ioam6_build_state(struct net *net, struct nlattr *nla,
+ 	return err;
+ }
+ 
+-static int ioam6_do_fill(struct net *net, struct sk_buff *skb)
++static int ioam6_do_fill(struct net *net, struct sk_buff *skb, struct ioam6_lwt *ilwt)
+ {
++	u8 payload[IOAM6_MAX_IOAM_NODE_DATA] = {0};
++	u8 nonce[IOAM6_CIPHER_NONCE_LEN] = {0};
++	u8 tag[IOAM6_CIPHER_TAG_LEN] = {0};
++	u8 offset, payload_len, *addr;
+ 	struct ioam6_trace_hdr *trace;
++	struct ipv6_hopopt_hdr *eh;
+ 	struct ioam6_namespace *ns;
++	struct ioam6_hdr *hdr;
+ 
+ 	trace = (struct ioam6_trace_hdr *)(skb_transport_header(skb)
+ 					   + sizeof(struct ipv6_hopopt_hdr) + 2
+ 					   + sizeof(struct ioam6_hdr));
+ 
++	payload_len = trace->nodelen * 4;
++
++	// We have multipled trace size by 4 in ioam6_build_state
++	// Math here is in multiples of 4B
++	if (trace->remlen*4 < trace->nodelen + IOAM6_CIPHER_TAG_LEN/4 + IOAM6_CIPHER_NONCE_LEN/4)
++		return -1;
++
++	hdr = (struct ioam6_hdr *)(skb_transport_header(skb) + sizeof(struct ipv6_hopopt_hdr) + 2);
++	eh = (struct ipv6_hopopt_hdr *)(skb_transport_header(skb));
++
+ 	ns = ioam6_namespace(net, trace->namespace_id);
+-	if (ns)
++	if (!ns)
++		return 0;
++
++	if (!net->ipv6.sysctl.ioam6_encap_security) {
+ 		ioam6_fill_trace_data(skb, ns, trace, false);
++		return 0;
++	}
++
++	put_unaligned_be32(atomic_read(&ilwt->pkt_cnt), nonce+8);
++
++	ioam6_gather_data(skb, ns, trace, false, payload);
++
++	if (!net->ipv6.sysctl.ioam6_encap_security_chacha)
++		ioam6_sec_aead(AES_GCM, payload, nonce, tag, net, ns, trace);
++	else
++		ioam6_sec_aead(CHACHA, payload, nonce, tag, net, ns, trace);
++
++	offset = ALIGN(payload_len + IOAM6_CIPHER_TAG_LEN + IOAM6_CIPHER_NONCE_LEN, 16);
++	addr = trace->data + trace->remlen * 16 - offset;
++	memcpy(addr, nonce, IOAM6_CIPHER_NONCE_LEN);
++	addr+=IOAM6_CIPHER_NONCE_LEN;
++	memcpy(addr, tag, IOAM6_CIPHER_TAG_LEN);
++	addr+=IOAM6_CIPHER_TAG_LEN;
++	memcpy(addr, payload, payload_len);
++	trace->remlen -= offset/16;
+ 
+ 	return 0;
+ }
+ 
+ static int ioam6_do_inline(struct net *net, struct sk_buff *skb,
+-			   struct ioam6_lwt_encap *tuninfo,
++			   struct ioam6_lwt *ilwt,
+ 			   struct dst_entry *cache_dst)
+ {
++	struct ioam6_lwt_encap *tuninfo = &(ilwt->tuninfo);
+ 	struct ipv6hdr *oldhdr, *hdr;
+ 	int hdrlen, err;
+ 
+@@ -294,7 +347,7 @@ static int ioam6_do_inline(struct net *net, struct sk_buff *skb,
+ 	hdr->nexthdr = NEXTHDR_HOP;
+ 	hdr->payload_len = cpu_to_be16(skb->len - sizeof(*hdr));
+ 
+-	return ioam6_do_fill(net, skb);
++	return ioam6_do_fill(net, skb, ilwt);
+ }
+ 
+ static int ioam6_do_encap(struct net *net, struct sk_buff *skb,
+@@ -340,7 +393,7 @@ static int ioam6_do_encap(struct net *net, struct sk_buff *skb,
+ 
+ 	skb_postpush_rcsum(skb, hdr, len);
+ 
+-	return ioam6_do_fill(net, skb);
++	return ioam6_do_fill(net, skb, NULL);
+ }
+ 
+ static int ioam6_output(struct net *net, struct sock *sk, struct sk_buff *skb)
+@@ -383,7 +436,7 @@ static int ioam6_output(struct net *net, struct sock *sk, struct sk_buff *skb)
+ 		if (ipv6_hdr(skb)->nexthdr == NEXTHDR_HOP)
+ 			goto out;
+ 
+-		err = ioam6_do_inline(net, skb, &ilwt->tuninfo, dst);
++		err = ioam6_do_inline(net, skb, ilwt, dst);
+ 		if (unlikely(err))
+ 			goto drop;
+ 
+diff --git a/net/ipv6/sysctl_net_ipv6.c b/net/ipv6/sysctl_net_ipv6.c
+index d2cd33e26..39fa33587 100644
+--- a/net/ipv6/sysctl_net_ipv6.c
++++ b/net/ipv6/sysctl_net_ipv6.c
+@@ -213,6 +213,24 @@ static struct ctl_table ipv6_table_template[] = {
+ 		.proc_handler	= proc_doulongvec_minmax,
+ 		.extra2		= &ioam6_id_wide_max,
+ 	},
++	{
++		.procname	= "ioam6_encap_security",
++		.data		= &init_net.ipv6.sysctl.ioam6_encap_security,
++		.maxlen		= sizeof(u8),
++		.mode		= 0644,
++		.proc_handler	= proc_dou8vec_minmax,
++		.extra1		= SYSCTL_ZERO,
++		.extra2		= SYSCTL_ONE,
++	},
++	{
++		.procname	= "ioam6_encap_security_chacha",
++		.data		= &init_net.ipv6.sysctl.ioam6_encap_security_chacha,
++		.maxlen		= sizeof(u8),
++		.mode		= 0644,
++		.proc_handler	= proc_dou8vec_minmax,
++		.extra1		= SYSCTL_ZERO,
++		.extra2		= SYSCTL_ONE,
++	},
+ };
+ 
+ static struct ctl_table ipv6_rotable[] = {
